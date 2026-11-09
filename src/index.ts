@@ -1,64 +1,193 @@
 import { DurableObject } from "cloudflare:workers";
 
-/**
- * Welcome to Cloudflare Workers! This is your first Durable Objects application.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your Durable Object in action
- * - Run `npm run deploy` to publish your application
- *
- * Bind resources to your worker in `wrangler.jsonc`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/durable-objects
- */
+interface ErrorReport {
+  event_id: string;
+}
 
-/** A Durable Object's behavior is defined in an exported Javascript class */
+const WINDOW_MS = 60 * 60 * 1000;
+const THRESHOLD = 10;
+
 export class MyDurableObject extends DurableObject<Env> {
-	/**
-	 * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
-	 * 	`DurableObjectStub::get` for a given identifier (no-op constructors can be omitted)
-	 *
-	 * @param ctx - The interface for interacting with Durable Object state
-	 * @param env - The interface to reference bindings declared in wrangler.jsonc
-	 */
-	constructor(ctx: DurableObjectState, env: Env) {
-		super(ctx, env);
-	}
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
 
-	/**
-	 * The Durable Object exposes an RPC method sayHello which will be invoked when a Durable
-	 *  Object instance receives a request from a Worker via the same method invocation on the stub
-	 *
-	 * @param name - The name provided to a Durable Object instance from a Worker
-	 * @returns The greeting to be sent back to the Worker
-	 */
-	async sayHello(name: string): Promise<string> {
-		return `Hello, ${name}!`;
-	}
+    // Сохраняем совместимость с уже созданной таблицей.
+    ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS errors (
+        event_id TEXT PRIMARY KEY,
+        received_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS errors_received_at
+      ON errors(received_at);
+    `);
+  }
+
+  async record(report: ErrorReport) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      const now = Date.now();
+
+      const result = this.ctx.storage.transactionSync(() => {
+        // Удаляем ошибки старше часа.
+        this.ctx.storage.sql.exec(
+          "DELETE FROM errors WHERE received_at <= ?",
+          now - WINDOW_MS
+        );
+
+        // Повторное событие с тем же ID не считается.
+        this.ctx.storage.sql.exec(
+          `INSERT OR IGNORE INTO errors
+           (event_id, received_at)
+           VALUES (?, ?)`,
+          report.event_id,
+          now
+        );
+
+        const { count } = this.ctx.storage.sql
+          .exec<{ count: number }>(
+            "SELECT COUNT(*) AS count FROM errors"
+          ).one();
+
+        return {
+          count,
+          window_minutes: 60,
+          threshold_reached: count >= THRESHOLD
+        };
+      });
+
+      if (result.threshold_reached) {
+        await this.ctx.storage.transaction(async (tx) => {
+          const pending = await tx.get<boolean>("ping_pending");
+          const lastSent = await tx.get<number>("last_ping_at");
+
+          const cooldownPassed =
+            lastSent === undefined || now - lastSent >= WINDOW_MS;
+
+          // Одно ожидающее уведомление и пауза на час после успеха.
+          if (!pending && cooldownPassed) {
+            await tx.put("ping_pending", true);
+            await tx.setAlarm(Date.now() + 1000);
+          }
+        });
+      }
+
+      return result;
+    });
+  }
+
+  async alarm() {
+    await this.ctx.blockConcurrencyWhile(async () => {
+      const pending =
+        await this.ctx.storage.get<boolean>("ping_pending");
+
+      if (!pending) {
+        return;
+      }
+
+      try {
+        if (!this.env.PING_TOKEN) {
+          throw new Error("Не задан PING_TOKEN");
+        }
+
+        console.log(
+          "Отправка PING, объект:",
+          this.ctx.id.toString()
+        );
+
+        const response = await fetch(
+          "https://webhook.site/550ccb1b-f92e-4748-af88-f3dec520a14e",
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${this.env.PING_TOKEN}`
+            },
+            redirect: "manual",
+            signal: AbortSignal.timeout(5000)
+          }
+        );
+
+        const status = response.status;
+        await response.body?.cancel();
+
+        if (!response.ok) {
+          throw new Error(`Сайт ответил HTTP ${status}`);
+        }
+      } catch (error) {
+        console.error(
+          "PING не доставлен, повтор через минуту:",
+          error
+        );
+
+        await this.ctx.storage.setAlarm(Date.now() + 60_000);
+        return;
+      }
+
+      await this.ctx.storage.transaction(async (tx) => {
+        await tx.put("last_ping_at", Date.now());
+        await tx.delete("ping_pending");
+      });
+
+      console.log("PING успешно отправлен на сайт");
+    });
+  }
+}
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type"
+};
+
+function json(data: unknown, status = 200): Response {
+  return Response.json(data, {
+    status,
+    headers: corsHeaders
+  });
 }
 
 export default {
-	/**
-	 * This is the standard fetch handler for a Cloudflare Worker
-	 *
-	 * @param request - The request submitted to the Worker from the client
-	 * @param env - The interface to reference bindings declared in wrangler.jsonc
-	 * @param ctx - The execution context of the Worker
-	 * @returns The response to be sent back to the client
-	 */
-	async fetch(request, env, ctx): Promise<Response> {
-		// Create a stub to open a communication channel with the Durable Object
-		// instance named "foo".
-		//
-		// Requests from all Workers to the Durable Object instance named "foo"
-		// will go to a single remote Durable Object instance.
-		const stub = env.MY_DURABLE_OBJECT.getByName("foo");
+  async fetch(request, env): Promise<Response> {
+    const url = new URL(request.url);
 
-		// Call the `sayHello()` RPC method on the stub to invoke the method on
-		// the remote Durable Object instance.
-		const greeting = await stub.sayHello("world");
+    if (url.pathname !== "/report") {
+      return json({ error: "Not found" }, 404);
+    }
 
-		return new Response(greeting);
-	},
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders
+      });
+    }
+
+    if (request.method !== "POST") {
+      return json({ error: "Use POST /report" }, 405);
+    }
+
+    let report: ErrorReport;
+
+    try {
+      const body = await request.json<Partial<ErrorReport>>();
+
+      if (
+        typeof body?.event_id !== "string" ||
+        !body.event_id.trim() ||
+        body.event_id.length > 100
+      ) {
+        return json({ error: "Invalid event_id" }, 400);
+      }
+
+      report = {
+        event_id: body.event_id
+      };
+    } catch {
+      return json({ error: "Invalid JSON" }, 400);
+    }
+
+    // Один общий счётчик для всех пользователей.
+    const stub = env.MY_DURABLE_OBJECT.getByName("app-api-errors");
+    const result = await stub.record(report);
+
+    return json(result);
+  }
 } satisfies ExportedHandler<Env>;
